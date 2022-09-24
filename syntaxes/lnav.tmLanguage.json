@@ -48,7 +48,7 @@
 		"sql": {
 			"name": "meta.embedded.block.sqlite",
 			"begin": "^;",
-			"end": "(?=^(?:;|:|/|\\|))",
+			"end": "(?=^(?:;|#|:|/|\\|))",
 			"patterns": [
 				{
 					"include": "source.sql"
