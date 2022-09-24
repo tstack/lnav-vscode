@@ -1,6 +1,10 @@
 {
   "publisher": "lnav",
   "name": "lnav",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tstack/lnav-vscode.git"
+  },
   "displayName": "lnav",
   "description": "Extension for Logfile Navigator scripts",
   "version": "0.0.1",
