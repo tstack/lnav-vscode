@@ -59,16 +59,6 @@
 				}
 			]
 		},
-		"search": {
-			"name": "meta.embedded.block.regex",
-			"begin": "^/",
-			"end": "(?=^;|:|/|\\|)",
-			"patterns": [
-				{
-					"include": "source.regex"
-				}
-			]
-		},
 		"variables": {
 			"patterns": [
 				{

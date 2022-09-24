@@ -1,7 +1,7 @@
 {
   "name": "lnav",
   "displayName": "lnav",
-  "description": "lnav scripting",
+  "description": "Extension for Logfile Navigator scripts",
   "version": "0.0.1",
   "engines": {
     "vscode": "^1.71.0"
@@ -28,8 +28,7 @@
         "scopeName": "source.lnav",
         "path": "./syntaxes/lnav.tmLanguage.json",
         "embeddedLanguages": {
-          "meta.embedded.block.sqlite": "sqlite",
-          "meta.embedded.block.regex": "regex"
+          "meta.embedded.block.sqlite": "sqlite"
         }
       }
     ]
