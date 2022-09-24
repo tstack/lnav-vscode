@@ -1,0 +1,82 @@
+{
+	"$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+	"name": "lnav",
+	"patterns": [
+		{
+			"include": "#keywords"
+		},
+		{
+			"include": "#variables"
+		},
+		{
+			"include": "#strings"
+		},
+		{
+			"include": "#comments"
+		},
+		{
+			"include": "#sql"
+		},
+		{
+			"include": "#search"
+		}
+	],
+	"repository": {
+		"comments": {
+			"patterns": [{
+				"name": "comment.line",
+				"match": "#.*"
+			}]
+		},
+		"keywords": {
+			"patterns": [{
+				"name": "keyword.control.lnav",
+				"match": "^:[\\w\\-]+"
+			}]
+		},
+		"strings": {
+			"name": "string.quoted.double.lnav",
+			"begin": "\"",
+			"end": "\"",
+			"patterns": [
+				{
+					"name": "constant.character.escape.lnav",
+					"match": "\\\\."
+				}
+			]
+		},
+		"sql": {
+			"name": "meta.embedded.block.sqlite",
+			"begin": "^;",
+			"end": "(?=^;|:|/|\\|)",
+			"patterns": [
+				{
+					"include": "source.sql"
+				},
+				{
+					"name": "variable.name",
+					"match": "\\$(?:\\w+|{[^}]+})"
+				}
+			]
+		},
+		"search": {
+			"name": "meta.embedded.block.regex",
+			"begin": "^/",
+			"end": "(?=^;|:|/|\\|)",
+			"patterns": [
+				{
+					"include": "source.regex"
+				}
+			]
+		},
+		"variables": {
+			"patterns": [
+				{
+					"name": "variable.name",
+					"match": "\\$(?:\\w+|{[^}]+})"
+				}
+			]
+		}
+	},
+	"scopeName": "source.lnav"
+}
