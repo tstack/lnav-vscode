@@ -478,11 +478,17 @@ export class DebugSession extends LoggingDebugSession {
         outputChannel.appendLine(`stackTraceRequest ${JSON.stringify(args)}`);
 
         const getCurrLineScript = `
-;SELECT thread_id AS curr_thread_id FROM all_thread_ids WHERE rowid = ${args.threadId}
+;SELECT
+    CASE thread_id
+      WHEN '' THEN NULL
+      ELSE thread_id
+    END AS curr_thread_id
+  FROM all_thread_ids
+  WHERE rowid = ${args.threadId}
 ;SELECT *
    FROM all_logs
   WHERE log_line <= log_msg_line() AND
-        log_thread_id = $curr_thread_id
+        log_thread_id IS $curr_thread_id
   ORDER BY log_line DESC
   LIMIT 1
 :write-json-to -
