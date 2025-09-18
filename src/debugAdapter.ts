@@ -10,6 +10,7 @@ import {
     InitializedEvent, StoppedEvent,
     Handles,
     Variable,
+    ThreadEvent,
 } from '@vscode/debugadapter';
 import { DebugProtocol } from '@vscode/debugprotocol';
 import * as vscode from 'vscode';
@@ -63,7 +64,13 @@ interface IAttachRequestArguments extends DebugProtocol.LaunchRequestArguments {
 
 const getThreadIdsScript = `
 ;SELECT log_time AS curr_time FROM all_logs WHERE log_line = log_msg_line() LIMIT 1
-;SELECT rowid, thread_id FROM all_thread_ids WHERE $curr_time BETWEEN earliest AND latest;
+;SELECT rowid,
+        CASE thread_id
+          WHEN '' THEN 'untitled'
+          ELSE thread_id
+        END AS thread_id
+   FROM all_thread_ids
+  WHERE $curr_time BETWEEN earliest AND latest;
 :write-json-to -
 `;
 
@@ -204,7 +211,7 @@ export class DebugSession extends LoggingDebugSession {
     private _attachArgs: IAttachRequestArguments = { port: 0, apiKey: "" };
     private _pollInput: PollInput = { last_event_id: 0, view_states: { log: "", text: "" } };
     private _mapping?: LogMapping = undefined;
-    private _currentThreadId?: number = undefined;
+    private _previousThreadIds: Set<number> = new Set();
 
     /**
      * Create a new debug adapter to use with a debug session.
@@ -386,22 +393,42 @@ export class DebugSession extends LoggingDebugSession {
     protected threadsRequest(response: DebugProtocol.ThreadsResponse): void {
         outputChannel.appendLine(`threadsRequest`);
 
-        sendDebuggerCommand(this._attachArgs as IAttachRequestArguments, '/exec', getThreadIdsScript)
-            .then((rows) => {
-                outputChannel.appendLine(`got thread ids: ${JSON.stringify(rows)}`);
-                if (rows.length === 0) {
-                    response.body = {
-                        threads: [
-                            new Thread(0, "main"),
-                        ]
-                    };
-                } else {
-                    response.body = {
-                        threads: rows.map((row: any) => {
-                            return new Thread(row.rowid, row.thread_id);
-                        })
-                    };
+        // Fetch the latest threads from lnav
+        sendDebuggerCommand(this._attachArgs, '/exec', getThreadIdsScript)
+            .then((threads: { rowid: number, thread_id: string }[]) => {
+                const latestThreadIds = new Set<number>();
+                const threadObjs: DebugProtocol.Thread[] = [];
+
+                outputChannel.appendLine(`got threads: ${JSON.stringify(threads)}`);
+                for (const t of threads) {
+                    latestThreadIds.add(t.rowid);
+                    threadObjs.push(new Thread(t.rowid, t.thread_id));
                 }
+
+                // Threads that have started
+                for (const id of latestThreadIds) {
+                    if (!this._previousThreadIds.has(id)) {
+                        outputChannel.appendLine(`thread started: ${id}`);
+                        this.sendEvent(new ThreadEvent('started', id));
+                    }
+                }
+
+                // Threads that have exited
+                for (const id of this._previousThreadIds) {
+                    if (!latestThreadIds.has(id)) {
+                        outputChannel.appendLine(`thread exited: ${id}`);
+                        this.sendEvent(new ThreadEvent('exited', id));
+                    }
+                }
+
+                this._previousThreadIds = latestThreadIds;
+
+                response.body = { threads: threadObjs };
+                this.sendResponse(response);
+            })
+            .catch((err) => {
+                outputChannel.appendLine(`Error fetching threads: ${err}`);
+                response.body = { threads: [] };
                 this.sendResponse(response);
             });
     }
