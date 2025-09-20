@@ -51,6 +51,11 @@ interface PollInput {
     view_states: ViewStates,
 }
 
+interface FindBreakpointResult {
+    bpids: Array<number>,
+    thread_id: number,
+}
+
 interface ILaunchRequestArguments extends DebugProtocol.LaunchRequestArguments {
     logFile: string;
 }
@@ -61,6 +66,29 @@ interface IAttachRequestArguments extends DebugProtocol.LaunchRequestArguments {
     // the API key used to communicate with lnav
     apiKey: string;
 }
+
+const createBreakpointTableScript = `
+;DROP TABLE IF EXISTS vscode_breakpoints
+;CREATE TABLE IF NOT EXISTS vscode_breakpoints (
+    pattern TEXT PRIMARY KEY,
+    path TEXT,
+    breakpoint_id INTEGER
+)
+`;
+
+const deleteBreakpointsScript = `
+;DELETE FROM vscode_breakpoints WHERE path = $headers ->> '$.x-source-file'
+`;
+
+const findBreakpointIdScript = `
+;SELECT json(json_group_array(vb.breakpoint_id)) AS bpids, ati.rowid AS thread_id
+   FROM all_logs
+   LEFT JOIN vscode_breakpoints AS vb ON log_body REGEXP vb.pattern
+   LEFT JOIN all_thread_ids AS ati ON ifnull(log_thread_id, '') = ati.thread_id
+  WHERE log_line = log_msg_line() AND
+        vb.breakpoint_id IS NOT NULL
+:write-json-to -
+`;
 
 const getThreadIdsScript = `
 ;SELECT log_time AS curr_time FROM all_logs WHERE log_line = log_msg_line() LIMIT 1
@@ -73,36 +101,6 @@ const getThreadIdsScript = `
   WHERE $curr_time BETWEEN earliest AND latest;
 :write-json-to -
 `;
-
-const nextLineScript = `
-;SELECT log_line AS curr_line, log_thread_id AS curr_thread_id
-   FROM all_logs
-  WHERE log_line = log_msg_line()
-;SELECT log_line AS next_line
-   FROM all_logs
-  WHERE log_line > $curr_line AND
-        log_msg_src IS NOT NULL AND
-        log_thread_id IS $curr_thread_id
-  ORDER BY log_line ASC
-  LIMIT 1;
-;SELECT raise_error('No further log messages from this thread') WHERE $next_line IS NULL;
-;UPDATE lnav_views SET selection = $next_line WHERE name = 'log';
-`
-
-const prevLineScript = `
-;SELECT log_line AS curr_line, log_thread_id AS curr_thread_id
-   FROM all_logs
-  WHERE log_line = log_msg_line()
-;SELECT log_line AS prev_line
-   FROM all_logs
-  WHERE log_line < $curr_line AND
-        log_thread_id IS $curr_thread_id AND
-        log_msg_src IS NOT NULL
-  ORDER BY log_line DESC
-  LIMIT 1;
-;SELECT raise_error('No previous log messages from this thread') WHERE $prev_line IS NULL;
-;UPDATE lnav_views SET selection = $prev_line WHERE name = 'log';
-`
 
 function getDebuggerInfo(args: IAttachRequestArguments, path: string): Promise<any> {
     const timeoutMs = 10000;
@@ -158,18 +156,26 @@ class ExecError extends Error {
     }
 }
 
-function sendDebuggerCommand(args: IAttachRequestArguments, path: string, data: string): Promise<any> {
+function sendDebuggerCommand(
+    args: IAttachRequestArguments,
+    path: string,
+    data: string,
+    headers?: Record<string, string>
+): Promise<any> {
     return new Promise((resolve, reject) => {
+        const defaultHeaders: Record<string, string> = {
+            'X-Api-Key': args.apiKey,
+            'Content-Type': path == '/exec' ? 'text/x-lnav-script' : 'application/json',
+            'Content-Length': Buffer.byteLength(data).toString()
+        };
+        const mergedHeaders = { ...defaultHeaders, ...(headers ?? {}) };
+
         const options: http.RequestOptions = {
             hostname: 'localhost',
             port: args.port,
             path: path,
             method: 'POST',
-            headers: {
-                'X-Api-Key': args.apiKey,
-                'Content-Type': path == '/exec' ? 'text/x-lnav-script' : 'application/json',
-                'Content-Length': Buffer.byteLength(data)
-            }
+            headers: mergedHeaders
         };
 
         const req = http.request(options, (res) => {
@@ -177,7 +183,9 @@ function sendDebuggerCommand(args: IAttachRequestArguments, path: string, data: 
             let responseData = '';
             res.on('data', (chunk) => responseData += chunk);
             res.on('end', () => {
-                outputChannel.appendLine(`response: ${responseData}`);
+                outputChannel.info(`request: ${path}`);
+                outputChannel.info(`${data}`);
+                outputChannel.info(`response: ${responseData}`);
                 if (isError) {
                     const contentType = res.headers['content-type'];
                     if (contentType && contentType.includes('application/json')) {
@@ -206,12 +214,14 @@ function sendDebuggerCommand(args: IAttachRequestArguments, path: string, data: 
 }
 
 export class DebugSession extends LoggingDebugSession {
-    private _breakPoints = new Map<string, DebugProtocol.Breakpoint[]>();
-    private _variableHandles = new Handles<'locals'>();
     private _attachArgs: IAttachRequestArguments = { port: 0, apiKey: "" };
     private _pollInput: PollInput = { last_event_id: 0, view_states: { log: "", text: "" } };
-    private _mapping?: LogMapping = undefined;
+    private _mapping: Map<number, LogMapping> = new Map();
+    private _variableHandles: Map<number, Handles<'locals'>> = new Map();
+    private _variableToFrame: Map<number, number> = new Map();
     private _previousThreadIds: Set<number> = new Set();
+    private _attached = false;
+    private _nextBreakpointId = 1;
 
     /**
      * Create a new debug adapter to use with a debug session.
@@ -222,34 +232,55 @@ export class DebugSession extends LoggingDebugSession {
         this.setDebuggerLinesStartAt1(true);
         this.setDebuggerColumnsStartAt1(true);
 
-        outputChannel.appendLine("Starting up...");
+        outputChannel.info("Starting up...");
     }
 
     private pollLnav() {
-        outputChannel.appendLine(`pollLnav: last_event_id=${this._pollInput.last_event_id}, view_states=${JSON.stringify(this._pollInput.view_states)}`);
+        outputChannel.info(`pollLnav: last_event_id=${this._pollInput.last_event_id}, view_states=${JSON.stringify(this._pollInput.view_states)}`);
         const prevViewStates = { ...this._pollInput.view_states };
 
-        sendDebuggerCommand(this._attachArgs as IAttachRequestArguments, '/poll', JSON.stringify(this._pollInput))
-            .then((input: PollInput) => {
-                outputChannel.appendLine(`pollLnav: ${JSON.stringify(input)}`);
-                this._pollInput = input;
+        if (this._attached) {
+            sendDebuggerCommand(this._attachArgs as IAttachRequestArguments, '/poll', JSON.stringify(this._pollInput))
+                .then((input: PollInput) => {
+                    outputChannel.info(`pollLnav: ${JSON.stringify(input)}`);
+                    this._pollInput = input;
 
-                // Only send StoppedEvent if PollInput has changed
-                if (input.last_event_id !== this._pollInput.last_event_id ||
-                    input.view_states.log !== prevViewStates.log ||
-                    input.view_states.text !== prevViewStates.text
-                ) {
-                    let event: DebugProtocol.StoppedEvent = new StoppedEvent('pause');
-                    event.body.allThreadsStopped = true;
-                    this.sendEvent(event);
-                }
-
-                this.pollLnav();
-            });
+                    // Only send StoppedEvent if PollInput has changed
+                    if (input.last_event_id !== this._pollInput.last_event_id ||
+                        input.view_states.log !== prevViewStates.log ||
+                        input.view_states.text !== prevViewStates.text
+                    ) {
+                        sendDebuggerCommand(this._attachArgs, '/exec', findBreakpointIdScript)
+                        .then((res: Array<FindBreakpointResult>) => {
+                            outputChannel.info(`stop breakpoints ${res}`);
+                            let event: DebugProtocol.StoppedEvent = new StoppedEvent(
+                                (res.length > 0 && res[0].bpids.length > 0) ? 'breakpoint' : 'pause');
+                            if (res.length > 0) {
+                                event.body.threadId = res[0].thread_id;
+                                event.body.hitBreakpointIds = res[0].bpids;
+                            }
+                            event.body.allThreadsStopped = true;
+                            this.sendEvent(event);
+                            this.pollLnav();
+                        })
+                        .catch((err) => {
+                            outputChannel.error(`poll failed ${err}`);
+                            this.pollLnav();
+                        });
+                    } else {
+                        this.pollLnav();
+                    }
+                })
+                .catch((err) => {
+                    outputChannel.error(`poll failed: ${err}`);
+                    this.pollLnav();
+                });
+        }
     }
 
     protected disconnectRequest(response: DebugProtocol.DisconnectResponse, args: DebugProtocol.DisconnectArguments, request?: DebugProtocol.Request): void {
-        outputChannel.appendLine(`disconnectRequest suspend: ${args.suspendDebuggee}, terminate: ${args.terminateDebuggee}`);
+        outputChannel.info(`disconnectRequest suspend: ${args.suspendDebuggee}, terminate: ${args.terminateDebuggee}`);
+        this._attached = false;
         if (args.terminateDebuggee) {
             sendDebuggerCommand(this._attachArgs, '/exec', ':quit')
                 .finally(() => {
@@ -261,7 +292,7 @@ export class DebugSession extends LoggingDebugSession {
     }
 
     protected terminateRequest(response: DebugProtocol.TerminateResponse, args: DebugProtocol.TerminateArguments, request?: DebugProtocol.Request): void {
-        outputChannel.appendLine(`terminateRequest`);
+        outputChannel.info(`terminateRequest`);
         sendDebuggerCommand(this._attachArgs, '/exec', ':quit')
             .finally(() => {
                 this.sendResponse(response);
@@ -273,7 +304,7 @@ export class DebugSession extends LoggingDebugSession {
      * to interrogate the features the debug adapter provides.
      */
     protected initializeRequest(response: DebugProtocol.InitializeResponse, args: DebugProtocol.InitializeRequestArguments): void {
-        outputChannel.appendLine(`initializeRequest: ${JSON.stringify(args)}`);
+        outputChannel.info(`initializeRequest: ${JSON.stringify(args)}`);
 
         response.body = response.body || {};
         response.body.supportsStepBack = true;
@@ -281,61 +312,83 @@ export class DebugSession extends LoggingDebugSession {
         response.body.supportTerminateDebuggee = true;
 
         this.sendResponse(response);
-        this.sendEvent(new InitializedEvent());
     }
 
-    protected setBreakPointsRequest(response: DebugProtocol.SetBreakpointsResponse, args: DebugProtocol.SetBreakpointsArguments) {
-        outputChannel.appendLine(`setBreakPointsRequest ${JSON.stringify(args)}`);
+    protected setBreakPointsRequest(response: DebugProtocol.SetBreakpointsResponse, args: DebugProtocol.SetBreakpointsArguments): Promise<void> {
+        outputChannel.info(`setBreakPointsRequest ${JSON.stringify(args)}`);
 
         const bpPath = args.source.path as string;
         // TODO handle lines?
         const bps = args.breakpoints || [];
-        this._breakPoints.set(bpPath, new Array<DebugProtocol.Breakpoint>());
-        bps.forEach((sourceBp) => {
-            let bps = this._breakPoints.get(bpPath) || [];
-            bps.push({ line: sourceBp.line, verified: true });
-        });
-        const breakpoints = this._breakPoints.get(bpPath) || [];
-        response.body = {
-            breakpoints: breakpoints
-        };
+        let bpsOut = new Array<DebugProtocol.Breakpoint>();
+        const script = deleteBreakpointsScript.concat(bps.map((sourceBp) => {
+            let bpid = this._nextBreakpointId;
+            this._nextBreakpointId += 1;
+            const populateBreakpointTableScript = `
+;REPLACE INTO vscode_breakpoints
+    SELECT sls.pattern, $headers ->> '$.x-source-file', ${bpid}
+      FROM source_log_stmt($headers ->> '$.x-source-file') AS sls
+     WHERE ${sourceBp.line} BETWEEN sls.begin_line AND sls.end_line
+`;
+            bpsOut.push({ id: bpid, line: sourceBp.line, verified: true });
 
-        if (breakpoints.length > 0) {
-            this.sendEvent(new StoppedEvent('breakpoint'));
-        }
-        return this.sendResponse(response);
+            return populateBreakpointTableScript;
+        }).join('\n'));
+
+        response.body = {
+            breakpoints: bpsOut,
+        };
+        const extraHeader: Record<string, string> = {
+            'X-Source-File': bpPath,
+        };
+        outputChannel.info(`breakpoints: ${extraHeader} -> ${script}`);
+        return sendDebuggerCommand(this._attachArgs as IAttachRequestArguments, '/exec', script, extraHeader)
+            .then(() => {
+                let event: DebugProtocol.StoppedEvent = new StoppedEvent('pause');
+                event.body.allThreadsStopped = true;
+                this.sendEvent(event);
+                this.sendResponse(response);
+            })
+            .catch((err) => {
+                outputChannel.error(`failed to set breakpoint: ${err}`);
+                this.sendErrorResponse(response, 3002, err.message);
+            });
     }
 
-    protected attachRequest(response: DebugProtocol.AttachResponse, args: IAttachRequestArguments) {
-        outputChannel.appendLine(`attachRequest ${JSON.stringify(args)}`);
+    protected attachRequest(response: DebugProtocol.AttachResponse, args: IAttachRequestArguments): Promise<void> {
+        outputChannel.info(`attachRequest ${JSON.stringify(args)}`);
 
         // make sure to 'Stop' the buffered logging if 'trace' is not set
         logger.setup(Logger.LogLevel.Verbose, false);
 
         this._attachArgs = args;
 
-        getDebuggerInfo(args, '/version').then((info) => {
-            outputChannel.appendLine(`lnav version: ${info.version}`);
+        return getDebuggerInfo(args, '/version').then((info): Promise<void> => {
+            this._attached = true;
+            outputChannel.info(`lnav version: ${info.version}`);
             this.sendResponse(response);
-            outputChannel.appendLine(`sending StoppedEvent`);
             // Build ':add-source-path <workspace-path>' for each workspace folder
             const workspaceFolders = vscode.workspace.workspaceFolders ?? [];
-            const addSourcePathArgs = workspaceFolders
+            const initScript = workspaceFolders
                 .map(folder => `:add-source-path ${folder.uri.fsPath}\n`)
-                .join('\n');
-            sendDebuggerCommand(this._attachArgs as IAttachRequestArguments, '/exec', addSourcePathArgs)
+                .join('\n').concat(createBreakpointTableScript);
+            outputChannel.info(`init script: ${initScript}`);
+            return sendDebuggerCommand(this._attachArgs as IAttachRequestArguments, '/exec', initScript)
                 .then(() => {
-                    outputChannel.appendLine(`added source paths: ${addSourcePathArgs}`);
+                    this.sendEvent(new InitializedEvent());
+                    let event: DebugProtocol.StoppedEvent = new StoppedEvent('pause');
+                    event.body.allThreadsStopped = true;
+                    this.sendEvent(event);
                     this.pollLnav();
                 });
         }).catch((err) => {
-            outputChannel.appendLine(`error getting lnav version: ${err}`);
+            outputChannel.info(`error getting lnav version: ${err}`);
             this.sendErrorResponse(response, 3000, `Error connecting to lnav instance: ${err}`);
         });
     }
 
     protected launchRequest(response: DebugProtocol.LaunchResponse, args: ILaunchRequestArguments) {
-        outputChannel.appendLine(`launchRequest ${JSON.stringify(args)}`);
+        outputChannel.info(`launchRequest ${JSON.stringify(args)}`);
 
         exec('lnav -V', (error, stdout, stderr) => {
             if (error) {
@@ -373,7 +426,7 @@ export class DebugSession extends LoggingDebugSession {
                         port = info.port;
                         fs.unlinkSync(tempFilePath);
                     } catch (err) {
-                        outputChannel.appendLine(`Error reading/parsing temp file: ${err}`);
+                        outputChannel.info(`Error reading/parsing temp file: ${err}`);
                     }
                 }
                 if (port !== undefined) {
@@ -381,7 +434,7 @@ export class DebugSession extends LoggingDebugSession {
                 } else if (Date.now() - startTime < timeoutMs) {
                     setTimeout(pollForFile, pollIntervalMs);
                 } else {
-                    outputChannel.appendLine(`Timeout waiting for lnav info file: ${tempFilePath}`);
+                    outputChannel.info(`Timeout waiting for lnav info file: ${tempFilePath}`);
                     this.sendErrorResponse(response, 3001, `Timeout waiting for lnav info file`);
                 }
             };
@@ -390,16 +443,19 @@ export class DebugSession extends LoggingDebugSession {
         });
     }
 
-    protected threadsRequest(response: DebugProtocol.ThreadsResponse): void {
-        outputChannel.appendLine(`threadsRequest`);
+    protected threadsRequest(response: DebugProtocol.ThreadsResponse): Promise<void> {
+        outputChannel.info(`threadsRequest`);
 
+        this._mapping.clear();
+        this._variableHandles.clear();
+        this._variableToFrame.clear();
         // Fetch the latest threads from lnav
-        sendDebuggerCommand(this._attachArgs, '/exec', getThreadIdsScript)
+        return sendDebuggerCommand(this._attachArgs, '/exec', getThreadIdsScript)
             .then((threads: { rowid: number, thread_id: string }[]) => {
                 const latestThreadIds = new Set<number>();
                 const threadObjs: DebugProtocol.Thread[] = [];
 
-                outputChannel.appendLine(`got threads: ${JSON.stringify(threads)}`);
+                outputChannel.info(`got threads: ${JSON.stringify(threads)}`);
                 for (const t of threads) {
                     latestThreadIds.add(t.rowid);
                     threadObjs.push(new Thread(t.rowid, t.thread_id));
@@ -408,7 +464,7 @@ export class DebugSession extends LoggingDebugSession {
                 // Threads that have started
                 for (const id of latestThreadIds) {
                     if (!this._previousThreadIds.has(id)) {
-                        outputChannel.appendLine(`thread started: ${id}`);
+                        outputChannel.info(`thread started: ${id}`);
                         this.sendEvent(new ThreadEvent('started', id));
                     }
                 }
@@ -416,7 +472,7 @@ export class DebugSession extends LoggingDebugSession {
                 // Threads that have exited
                 for (const id of this._previousThreadIds) {
                     if (!latestThreadIds.has(id)) {
-                        outputChannel.appendLine(`thread exited: ${id}`);
+                        outputChannel.info(`thread exited: ${id}`);
                         this.sendEvent(new ThreadEvent('exited', id));
                     }
                 }
@@ -427,31 +483,33 @@ export class DebugSession extends LoggingDebugSession {
                 this.sendResponse(response);
             })
             .catch((err) => {
-                outputChannel.appendLine(`Error fetching threads: ${err}`);
+                outputChannel.info(`Error fetching threads: ${err}`);
                 response.body = { threads: [] };
                 this.sendResponse(response);
             });
     }
 
     protected continueRequest(response: DebugProtocol.ContinueResponse, args: DebugProtocol.ContinueArguments): void {
-        outputChannel.appendLine(`continueRequest ${JSON.stringify(args)}`);
+        outputChannel.info(`continueRequest ${JSON.stringify(args)}`);
 
-        this.sendEvent(new StoppedEvent('breakpoint'));
-        this.sendResponse(response);
-    }
+        const continueScript = `
+;SELECT thread_id AS curr_thread_id FROM all_thread_ids WHERE rowid = ${args.threadId}
+;SELECT log_line AS next_line
+   FROM all_logs
+   LEFT JOIN vscode_breakpoints ON log_body REGEXP pattern
+  WHERE log_line > log_msg_line() AND
+        log_msg_src IS NOT NULL AND
+        log_thread_id IS $curr_thread_id AND
+        pattern IS NOT NULL
+  ORDER BY log_line ASC
+  LIMIT 1
+;SELECT raise_error('No further breakpoints found for this thread') WHERE $next_line IS NULL;
+;UPDATE lnav_views SET selection = $next_line WHERE name = 'log';
+`;
 
-    protected reverseContinueRequest(response: DebugProtocol.ReverseContinueResponse, args: DebugProtocol.ReverseContinueArguments): void {
-        outputChannel.appendLine(`reverseContinueRequest ${JSON.stringify(args)}`);
-
-        this.sendEvent(new StoppedEvent('breakpoint'));
-        this.sendResponse(response);
-    }
-
-    protected nextRequest(response: DebugProtocol.NextResponse, args: DebugProtocol.NextArguments): void {
-        outputChannel.appendLine(`nextRequest ${JSON.stringify(args)}`);
-        sendDebuggerCommand(this._attachArgs, '/exec', nextLineScript)
+        sendDebuggerCommand(this._attachArgs, '/exec', continueScript)
             .then(() => {
-                outputChannel.appendLine(`stepped to next line`);
+                outputChannel.info(`continued to the next breakpoint`);
                 response.success = true;
                 this.sendResponse(response);
             })
@@ -459,22 +517,75 @@ export class DebugSession extends LoggingDebugSession {
                 if (err instanceof ExecError) {
                     this.sendErrorResponse(response, 3002, err.message);
                 } else {
-                    outputChannel.appendLine(`error stepping to next line: ${err}`);
+                    outputChannel.error(`error stepping to next line: ${err}`);
+                    this.sendErrorResponse(response, 3002, `Error stepping to next line: ${err}`);
+                }
+            });
+    }
+
+    protected reverseContinueRequest(response: DebugProtocol.ReverseContinueResponse, args: DebugProtocol.ReverseContinueArguments): void {
+        outputChannel.info(`reverseContinueRequest ${JSON.stringify(args)}`);
+
+        this.sendEvent(new StoppedEvent('breakpoint'));
+        this.sendResponse(response);
+    }
+
+    protected nextRequest(response: DebugProtocol.NextResponse, args: DebugProtocol.NextArguments): void {
+        outputChannel.info(`nextRequest ${JSON.stringify(args)}`);
+
+        const nextLineScript = `
+;SELECT thread_id AS curr_thread_id FROM all_thread_ids WHERE rowid = ${args.threadId}
+;SELECT log_line AS next_line
+   FROM all_logs
+  WHERE log_line > log_msg_line() AND
+        log_msg_src IS NOT NULL AND
+        log_thread_id IS $curr_thread_id
+  ORDER BY log_line ASC
+  LIMIT 1;
+;SELECT raise_error('No further log messages from this thread') WHERE $next_line IS NULL;
+;UPDATE lnav_views SET selection = $next_line WHERE name = 'log';
+`;
+
+        sendDebuggerCommand(this._attachArgs, '/exec', nextLineScript)
+            .then(() => {
+                outputChannel.info(`stepped to next line`);
+                response.success = true;
+                this.sendResponse(response);
+            })
+            .catch((err) => {
+                if (err instanceof ExecError) {
+                    this.sendErrorResponse(response, 3002, err.message);
+                } else {
+                    outputChannel.info(`error stepping to next line: ${err}`);
                     this.sendErrorResponse(response, 3002, `Error stepping to next line: ${err}`);
                 }
             });
     }
 
     protected stepBackRequest(response: DebugProtocol.StepBackResponse, args: DebugProtocol.StepBackArguments): void {
-        outputChannel.appendLine(`stepBackRequest ${JSON.stringify(args)}`);
+        outputChannel.info(`stepBackRequest ${JSON.stringify(args)}`);
+
+        const prevLineScript = `
+;SELECT thread_id AS curr_thread_id FROM all_thread_ids WHERE rowid = ${args.threadId}
+;SELECT log_line AS prev_line
+   FROM all_logs
+  WHERE log_line < log_msg_line() AND
+        log_thread_id IS $curr_thread_id AND
+        log_msg_src IS NOT NULL
+  ORDER BY log_line DESC
+  LIMIT 1;
+;SELECT raise_error('No previous log messages from this thread') WHERE $prev_line IS NULL;
+;UPDATE lnav_views SET selection = $prev_line WHERE name = 'log';
+`;
+
         sendDebuggerCommand(this._attachArgs, '/exec', prevLineScript)
             .then(() => {
-                outputChannel.appendLine(`stepped back one line`);
+                outputChannel.info(`stepped back one line`);
                 response.success = true;
                 this.sendResponse(response);
             })
             .catch((err) => {
-                outputChannel.appendLine(`error stepping to previous line: ${err}`);
+                outputChannel.info(`error stepping to previous line: ${err}`);
                 this.sendErrorResponse(response, 3002, `Error stepping to previous line: ${err}`);
             });
     }
@@ -501,8 +612,8 @@ export class DebugSession extends LoggingDebugSession {
         );
     }
 
-    protected stackTraceRequest(response: DebugProtocol.StackTraceResponse, args: DebugProtocol.StackTraceArguments): void {
-        outputChannel.appendLine(`stackTraceRequest ${JSON.stringify(args)}`);
+    protected stackTraceRequest(response: DebugProtocol.StackTraceResponse, args: DebugProtocol.StackTraceArguments): Promise<void> {
+        outputChannel.info(`stackTraceRequest ${JSON.stringify(args)}`);
 
         const getCurrLineScript = `
 ;SELECT
@@ -521,61 +632,75 @@ export class DebugSession extends LoggingDebugSession {
 :write-json-to -
 `;
 
-        sendDebuggerCommand(this._attachArgs as IAttachRequestArguments, '/exec', getCurrLineScript)
+        return sendDebuggerCommand(this._attachArgs as IAttachRequestArguments, '/exec', getCurrLineScript)
             .then((row) => {
-                outputChannel.appendLine(`got current line: ${JSON.stringify(row)}`);
+                outputChannel.info(`got current line: ${JSON.stringify(row)}`);
                 let row0 = row[0];
 
                 const srcRef: SourceRef = {
                     sourcePath: row[0].log_msg_src.file,
-                    lineNumber: row[0].log_msg_src.line,
+                    lineNumber: row[0].log_msg_src.begin_line,
                     name: row[0].log_msg_src.name,
                     column: 1,
                 };
-                this._mapping = {
+                this._mapping.set(args.threadId, {
                     srcRef: srcRef,
                     variables: row0.log_msg_values.map((element: { expr: string, value: string }) => {
                         let retval: VariablePair = { expr: element.expr, value: element.value };
                         return retval;
                     }),
-                };
-                let index = 0;
-                const currentFrame = this.buildStackFrame(index++, srcRef);
+                });
+                const currentFrame = this.buildStackFrame(args.threadId, srcRef);
                 const stack: StackFrame[] = [currentFrame];
 
                 response.body = {
                     stackFrames: stack,
                     totalFrames: stack.length
                 };
+                outputChannel.info(`response ${JSON.stringify(response.body)}`);
 
                 this.sendResponse(response);
+            })
+            .catch((err) => {
+                outputChannel.error(`stack trace request failed: ${err}`);
+                this.sendErrorResponse(response, 3002, err.message);
             });
     }
 
     protected scopesRequest(response: DebugProtocol.ScopesResponse, args: DebugProtocol.ScopesArguments): void {
-        outputChannel.appendLine(`scopesRequest ${JSON.stringify(args)}`);
+        outputChannel.info(`scopesRequest ${JSON.stringify(args)}`);
 
+        let handle = new Handles<'locals'>();
+        let variablesReferenceId = handle.create('locals');
+        this._variableHandles.set(args.frameId, handle);
+        this._variableToFrame.set(variablesReferenceId, args.frameId);
         response.body = {
             scopes: [
-                new Scope("Locals", this._variableHandles.create('locals'), false),
+                new Scope("Locals", variablesReferenceId, false),
             ]
         };
         this.sendResponse(response);
     }
 
     protected variablesRequest(response: DebugProtocol.VariablesResponse, args: DebugProtocol.VariablesArguments, request?: DebugProtocol.Request): void {
-        outputChannel.appendLine(`variablesRequest ${JSON.stringify(args)}`);
+        outputChannel.info(`variablesRequest ${JSON.stringify(args)}`);
 
         let vs: DebugProtocol.Variable[] = [];
 
-        const v = this._variableHandles.get(args.variablesReference);
-        if (this._mapping !== undefined) {
-            for (let pair of this._mapping.variables) {
-                vs.push({
-                    name: pair.expr,
-                    value: pair.value,
-                    variablesReference: 0
-                });
+        let threadId = this._variableToFrame.get(args.variablesReference);
+        outputChannel.info(`got thread id ${threadId}`)
+        if (threadId !== undefined) {
+            let vars = this._mapping.get(threadId)?.variables;
+            if (vars !== undefined) {
+                outputChannel.info(`got vars`);
+                for (let pair of vars) {
+                    outputChannel.info(`iterator`);
+                    vs.push({
+                        name: pair.expr,
+                        value: pair.value,
+                        variablesReference: 0
+                    });
+                }
             }
         }
 

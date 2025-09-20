@@ -12,7 +12,7 @@ import { ProviderResult } from 'vscode';
 import { DebugSession } from './debugAdapter';
 
 const runMode: 'external' | 'server' | 'namedPipeServer' | 'inline' = 'inline';
-const outputChannel = vscode.window.createOutputChannel("lnav");
+const outputChannel = vscode.window.createOutputChannel("lnav", {log: true});
 
 export { outputChannel }
 
