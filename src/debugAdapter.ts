@@ -81,12 +81,11 @@ const deleteBreakpointsScript = `
 `;
 
 const findBreakpointIdScript = `
-;SELECT json(json_group_array(vb.breakpoint_id)) AS bpids, ati.rowid AS thread_id
+;SELECT (SELECT json_group_array(breakpoint_id) FROM vscode_breakpoints WHERE log_body REGEXP pattern) AS bpids,
+        (SELECT rowid FROM all_thread_ids WHERE ifnull(log_thread_id, '') = thread_id) AS thread_id
    FROM all_logs
-   LEFT JOIN vscode_breakpoints AS vb ON log_body REGEXP vb.pattern
-   LEFT JOIN all_thread_ids AS ati ON ifnull(log_thread_id, '') = ati.thread_id
-  WHERE log_line = log_msg_line() AND
-        vb.breakpoint_id IS NOT NULL
+  WHERE log_line = log_msg_line()
+;SELECT json($bpids) AS bpids, $thread_id AS thread_id
 :write-json-to -
 `;
 
@@ -254,12 +253,13 @@ export class DebugSession extends LoggingDebugSession {
                         .then((res: Array<FindBreakpointResult>) => {
                             outputChannel.info(`stop breakpoints ${res}`);
                             let event: DebugProtocol.StoppedEvent = new StoppedEvent(
-                                (res.length > 0 && res[0].bpids.length > 0) ? 'breakpoint' : 'pause');
+                                (res.length > 0 && res[0].bpids.length > 0) ? 'breakpoint' : 'step');
                             if (res.length > 0) {
                                 event.body.threadId = res[0].thread_id;
                                 event.body.hitBreakpointIds = res[0].bpids;
                             }
                             event.body.allThreadsStopped = true;
+                            outputChannel.info(`sending stopped event: ${JSON.stringify(event)}`);
                             this.sendEvent(event);
                             this.pollLnav();
                         })
@@ -382,7 +382,7 @@ export class DebugSession extends LoggingDebugSession {
                     this.pollLnav();
                 });
         }).catch((err) => {
-            outputChannel.info(`error getting lnav version: ${err}`);
+            outputChannel.error(`error getting lnav version: ${err}`);
             this.sendErrorResponse(response, 3000, `Error connecting to lnav instance: ${err}`);
         });
     }
