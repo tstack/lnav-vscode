@@ -30,7 +30,6 @@ interface VariablePair {
 }
 
 interface LogMapping {
-    srcRef: SourceRef,
     variables: Array<VariablePair>,
 }
 
@@ -250,30 +249,29 @@ export class DebugSession extends LoggingDebugSession {
                         input.view_states.text !== prevViewStates.text
                     ) {
                         sendDebuggerCommand(this._attachArgs, '/exec', findBreakpointIdScript)
-                        .then((res: Array<FindBreakpointResult>) => {
-                            outputChannel.info(`stop breakpoints ${res}`);
-                            let event: DebugProtocol.StoppedEvent = new StoppedEvent(
-                                (res.length > 0 && res[0].bpids.length > 0) ? 'breakpoint' : 'step');
-                            if (res.length > 0) {
-                                event.body.threadId = res[0].thread_id;
-                                event.body.hitBreakpointIds = res[0].bpids;
-                            }
-                            event.body.allThreadsStopped = true;
-                            outputChannel.info(`sending stopped event: ${JSON.stringify(event)}`);
-                            this.sendEvent(event);
-                            this.pollLnav();
-                        })
-                        .catch((err) => {
-                            outputChannel.error(`poll failed ${err}`);
-                            this.pollLnav();
-                        });
+                            .then((res: Array<FindBreakpointResult>) => {
+                                outputChannel.info(`stop breakpoints ${res}`);
+                                let event: DebugProtocol.StoppedEvent = new StoppedEvent(
+                                    (res.length > 0 && res[0].bpids.length > 0) ? 'breakpoint' : 'step');
+                                if (res.length > 0) {
+                                    event.body.threadId = res[0].thread_id;
+                                    event.body.hitBreakpointIds = res[0].bpids;
+                                }
+                                event.body.allThreadsStopped = true;
+                                outputChannel.info(`sending stopped event: ${JSON.stringify(event)}`);
+                                this.sendEvent(event);
+                                this.pollLnav();
+                            })
+                            .catch((err) => {
+                                outputChannel.error(`poll failed ${err}`);
+                                this.pollLnav();
+                            });
                     } else {
                         this.pollLnav();
                     }
                 })
                 .catch((err) => {
                     outputChannel.error(`poll failed: ${err}`);
-                    this.pollLnav();
                 });
         }
     }
@@ -637,18 +635,24 @@ export class DebugSession extends LoggingDebugSession {
                 outputChannel.info(`got current line: ${JSON.stringify(row)}`);
                 let row0 = row[0];
 
-                const srcRef: SourceRef = {
-                    sourcePath: row[0].log_msg_src.file,
-                    lineNumber: row[0].log_msg_src.begin_line,
-                    name: row[0].log_msg_src.name,
-                    column: 1,
-                };
-                this._mapping.set(args.threadId, {
-                    srcRef: srcRef,
-                    variables: row0.log_msg_values.map((element: { expr: string, value: string }) => {
+                let srcRef: SourceRef | undefined;
+                if (row0.log_msg_src) {
+                    srcRef = {
+                        sourcePath: row0.log_msg_src.file,
+                        lineNumber: row0.log_msg_src.begin_line,
+                        name: row0.log_msg_src.name.replace(/\s+/g, ' '),
+                        column: 1,
+                    };
+                }
+                let vars = new Array<VariablePair>;
+                if (Array.isArray(row0.log_msg_values)) {
+                    vars = row0.log_msg_values.map((element: { expr: string, value: string }) => {
                         let retval: VariablePair = { expr: element.expr, value: element.value };
                         return retval;
-                    }),
+                    });
+                }
+                this._mapping.set(args.threadId, {
+                    variables: vars,
                 });
                 const currentFrame = this.buildStackFrame(args.threadId, srcRef);
                 const stack: StackFrame[] = [currentFrame];
