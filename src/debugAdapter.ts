@@ -113,7 +113,7 @@ function getDebuggerInfo(args: IAttachRequestArguments, path: string): Promise<a
                 path: path,
                 method: 'GET',
                 headers: {
-                    'X-Api-Key': args.apiKey,
+                    'X-Api-Key': Buffer.from(args.apiKey).toString('base64'),
                 }
             };
 
@@ -162,7 +162,7 @@ function sendDebuggerCommand(
 ): Promise<any> {
     return new Promise((resolve, reject) => {
         const defaultHeaders: Record<string, string> = {
-            'X-Api-Key': args.apiKey,
+            'X-Api-Key': Buffer.from(args.apiKey).toString('base64'),
             'Content-Type': path == '/exec' ? 'text/x-lnav-script' : 'application/json',
             'Content-Length': Buffer.byteLength(data).toString()
         };
