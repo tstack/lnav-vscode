@@ -11,6 +11,9 @@ import {
     Handles,
     Variable,
     ThreadEvent,
+    ProgressStartEvent,
+    ProgressEndEvent,
+    ProgressUpdateEvent,
 } from '@vscode/debugadapter';
 import { DebugProtocol } from '@vscode/debugprotocol';
 import * as vscode from 'vscode';
@@ -48,6 +51,27 @@ interface ViewStates {
 interface PollInput {
     last_event_id: number,
     view_states: ViewStates,
+    task_states: Array<number>,
+}
+
+interface ExtError {
+    error: string,
+    source: string,
+    help: string,
+}
+
+interface ExtPogress {
+    id: string,
+    status: 'idle' | 'working',
+    current_step: string,
+    completed: number,
+    total: number,
+    messages: Array<ExtError>,
+}
+
+interface PollResult {
+    next_input: PollInput,
+    background_tasks: Array<ExtPogress>
 }
 
 interface FindBreakpointResult {
@@ -107,6 +131,7 @@ function getDebuggerInfo(args: IAttachRequestArguments, path: string): Promise<a
 
     function attempt(): Promise<any> {
         return new Promise((resolve, reject) => {
+            outputChannel.info(`get debug args: ${JSON.stringify(args)}`);
             const options: http.RequestOptions = {
                 hostname: 'localhost',
                 port: args.port,
@@ -118,9 +143,16 @@ function getDebuggerInfo(args: IAttachRequestArguments, path: string): Promise<a
             };
 
             const req = http.request(options, (res) => {
+                outputChannel.info(`get debug info res: ${res.statusCode}`);
+                let isError = (res.statusCode && (res.statusCode < 200 || res.statusCode >= 400));
                 let responseData = '';
                 res.on('data', (chunk) => responseData += chunk);
-                res.on('end', () => resolve(JSON.parse(responseData)));
+                res.on('end', () => {
+                    if (isError) {
+                        return reject(new Error(responseData));
+                    }
+                    resolve(JSON.parse(responseData))
+                });
             });
 
             req.on('error', (e) => reject(e));
@@ -181,7 +213,7 @@ function sendDebuggerCommand(
             let responseData = '';
             res.on('data', (chunk) => responseData += chunk);
             res.on('end', () => {
-                outputChannel.info(`request: ${path}`);
+                outputChannel.info(`response to request for: ${path}`);
                 outputChannel.info(`${data}`);
                 outputChannel.info(`response: ${responseData}`);
                 if (isError) {
@@ -212,13 +244,16 @@ function sendDebuggerCommand(
 }
 
 export class DebugSession extends LoggingDebugSession {
+    private _initArgs: DebugProtocol.InitializeRequestArguments | undefined;
     private _attachArgs: IAttachRequestArguments = { port: 0, apiKey: "" };
-    private _pollInput: PollInput = { last_event_id: 0, view_states: { log: "", text: "" } };
+    private _pollInput: PollInput = { last_event_id: 0, view_states: { log: "", text: "" }, task_states: [] };
     private _mapping: Map<number, LogMapping> = new Map();
     private _variableHandles: Map<number, Handles<'locals'>> = new Map();
     private _variableToFrame: Map<number, number> = new Map();
     private _previousThreadIds: Set<number> = new Set();
+    private _previousBackgroundTaskIds: Set<string> = new Set();
     private _attached = false;
+    private _initialized = false;
     private _nextBreakpointId = 1;
 
     /**
@@ -236,17 +271,62 @@ export class DebugSession extends LoggingDebugSession {
     private pollLnav() {
         outputChannel.info(`pollLnav: last_event_id=${this._pollInput.last_event_id}, view_states=${JSON.stringify(this._pollInput.view_states)}`);
         const prevViewStates = { ...this._pollInput.view_states };
+        const prevTaskStates = this._pollInput.task_states;
 
         if (this._attached) {
             sendDebuggerCommand(this._attachArgs as IAttachRequestArguments, '/poll', JSON.stringify(this._pollInput))
-                .then((input: PollInput) => {
-                    outputChannel.info(`pollLnav: ${JSON.stringify(input)}`);
-                    this._pollInput = input;
+                .then((pollResult: PollResult) => {
+                    outputChannel.info(`pollLnav result: ${JSON.stringify(pollResult)}`);
 
+                    // handle background task start/stop events
+                    const latestBackgroundIds = new Set<string>();
+                    for (const task of pollResult.background_tasks || []) {
+                        latestBackgroundIds.add(task.id);
+                    }
+                    let task_ended = false;
+
+                    if (this._initArgs?.supportsProgressReporting) {
+                        // started tasks: in latest but not in previous
+                        for (const task of pollResult.background_tasks || []) {
+                            if (this._previousBackgroundTaskIds.has(task.id)) {
+                                if (task.status == 'working') {
+                                    outputChannel.info(`background task updated: ${task.id}`);
+                                    let prog_event: DebugProtocol.ProgressUpdateEvent = new ProgressUpdateEvent(task.id, task.current_step);
+                                    prog_event.body.percentage = task.completed * 100 / task.total;
+                                    this.sendEvent(prog_event);
+                                } else {
+                                    outputChannel.info(`background task ended: ${task.id}`);
+                                    this.sendEvent(new ProgressEndEvent(task.id));
+                                    task_ended = true;
+                                }
+                            } else {
+                                outputChannel.info(`background task started: ${task.id}`);
+                                // Use current_step as title if available
+                                const msg = task.current_step || 'background task';
+                                let prog_event: DebugProtocol.ProgressStartEvent = new ProgressStartEvent(task.id, 'lnav initialization', msg);
+                                prog_event.body.percentage = task.completed * 100 / task.total;
+                                this.sendEvent(prog_event);
+                            }
+                        }
+                    }
+
+                    if (!this._initialized && task_ended) {
+                        this._initialized = true;
+                        this.sendEvent(new InitializedEvent());
+                        //let event: DebugProtocol.StoppedEvent = new StoppedEvent('pause');
+                        //event.body.allThreadsStopped = true;
+                        //this.sendEvent(event);
+                    }
+
+                    // update previous background task ids
+                    this._previousBackgroundTaskIds = latestBackgroundIds;
+
+                    this._pollInput = pollResult.next_input;
                     // Only send StoppedEvent if PollInput has changed
-                    if (input.last_event_id !== this._pollInput.last_event_id ||
-                        input.view_states.log !== prevViewStates.log ||
-                        input.view_states.text !== prevViewStates.text
+                    if (this._initialized &&
+                        (pollResult.next_input.view_states.log !== prevViewStates.log ||
+                            pollResult.next_input.view_states.text !== prevViewStates.text ||
+                            task_ended)
                     ) {
                         sendDebuggerCommand(this._attachArgs, '/exec', findBreakpointIdScript)
                             .then((res: Array<FindBreakpointResult>) => {
@@ -256,6 +336,7 @@ export class DebugSession extends LoggingDebugSession {
                                 if (res.length > 0) {
                                     event.body.threadId = res[0].thread_id;
                                     event.body.hitBreakpointIds = res[0].bpids;
+                                    // event.body.preserveFocusHint = true;
                                 }
                                 event.body.allThreadsStopped = true;
                                 outputChannel.info(`sending stopped event: ${JSON.stringify(event)}`);
@@ -304,6 +385,7 @@ export class DebugSession extends LoggingDebugSession {
     protected initializeRequest(response: DebugProtocol.InitializeResponse, args: DebugProtocol.InitializeRequestArguments): void {
         outputChannel.info(`initializeRequest: ${JSON.stringify(args)}`);
 
+        this._initArgs = args;
         response.body = response.body || {};
         response.body.supportsStepBack = true;
         // response.body.supportsBreakpointLocationsRequest = true;
@@ -365,6 +447,8 @@ export class DebugSession extends LoggingDebugSession {
             this._attached = true;
             outputChannel.info(`lnav version: ${info.version}`);
             this.sendResponse(response);
+            outputChannel.info(`starting poller`);
+            this.pollLnav();
             // Build ':add-source-path <workspace-path>' for each workspace folder
             const workspaceFolders = vscode.workspace.workspaceFolders ?? [];
             const initScript = workspaceFolders
@@ -373,11 +457,6 @@ export class DebugSession extends LoggingDebugSession {
             outputChannel.info(`init script: ${initScript}`);
             return sendDebuggerCommand(this._attachArgs as IAttachRequestArguments, '/exec', initScript)
                 .then(() => {
-                    this.sendEvent(new InitializedEvent());
-                    let event: DebugProtocol.StoppedEvent = new StoppedEvent('pause');
-                    event.body.allThreadsStopped = true;
-                    this.sendEvent(event);
-                    this.pollLnav();
                 });
         }).catch((err) => {
             outputChannel.error(`error getting lnav version: ${err}`);
@@ -401,15 +480,32 @@ export class DebugSession extends LoggingDebugSession {
             }
 
             const tempFilePath = path.join(os.tmpdir(), `lnav-launch-${uuidv4()}.json`);
-            const writeInfoArg = `-c '|lnav-write-external-access-info-to ${tempFilePath}'`;
+            const writeInfoArg = `|lnav-write-external-access-info-to ${tempFilePath}`;
             const apiKey = uuidv4();
 
-            // Create and show a new terminal, then run a command
-            const terminal = vscode.window.createTerminal({ name: `lnav debug ${path.basename(args.logFile)}` });
-            terminal.show();
-            terminal.sendText(`exec lnav -d /tmp/vscode-lnav.err -c ':external-access 0 ${apiKey}' ${writeInfoArg} ${args.logFile}`);
-            vscode.commands.executeCommand('workbench.action.terminal.moveToEditor');
+            let runArgs: DebugProtocol.RunInTerminalRequestArguments = {
+                kind: "integrated", // "external",
+                title: "lnav",
+                cwd: ".",
+                args: [
+                    "/usr/local/bin/lnav",
+                    "-d", "/tmp/vscode-lnav.err",
+                    "-c", `:external-access 0 ${apiKey}`,
+                    "-c", writeInfoArg,
+                    args.logFile,
+                ],
+            };
+            this.runInTerminalRequest(runArgs, 600000, response => {
+                outputChannel.info(`run resp ${JSON.stringify(response)}`);
+            });
 
+            if (false) {
+                // Create and show a new terminal, then run a command
+                const terminal = vscode.window.createTerminal({ name: `lnav debug ${path.basename(args.logFile)}` });
+                terminal.show();
+                terminal.sendText(`exec lnav -d /tmp/vscode-lnav.err -c ':external-access 0 ${apiKey}' ${writeInfoArg} ${args.logFile}`);
+                // vscode.commands.executeCommand('workbench.action.terminal.moveToEditor');
+            }
             // Poll for tempFilePath creation, read and parse it
             const timeoutMs = 10000;
             const pollIntervalMs = 250;
@@ -417,14 +513,16 @@ export class DebugSession extends LoggingDebugSession {
             let port: number | undefined = undefined;
 
             const pollForFile = () => {
+                outputChannel.info(`Checking for port file: ${tempFilePath}`);
                 if (fs.existsSync(tempFilePath)) {
                     try {
                         const fileContent = fs.readFileSync(tempFilePath, 'utf8');
                         const info = JSON.parse(fileContent);
                         port = info.port;
+                        outputChannel.info(`Using port: ${port}`);
                         fs.unlinkSync(tempFilePath);
                     } catch (err) {
-                        outputChannel.info(`Error reading/parsing temp file: ${err}`);
+                        outputChannel.error(`Error reading/parsing temp file: ${err}`);
                     }
                 }
                 if (port !== undefined) {
@@ -437,6 +535,7 @@ export class DebugSession extends LoggingDebugSession {
                 }
             };
 
+            this.sendResponse(response);
             pollForFile();
         });
     }
@@ -524,8 +623,35 @@ export class DebugSession extends LoggingDebugSession {
     protected reverseContinueRequest(response: DebugProtocol.ReverseContinueResponse, args: DebugProtocol.ReverseContinueArguments): void {
         outputChannel.info(`reverseContinueRequest ${JSON.stringify(args)}`);
 
-        this.sendEvent(new StoppedEvent('breakpoint'));
-        this.sendResponse(response);
+        const reverseContinueScript = `
+;SELECT thread_id AS curr_thread_id FROM all_thread_ids WHERE rowid = ${args.threadId}
+;SELECT log_line AS prev_line
+   FROM all_logs
+   LEFT JOIN vscode_breakpoints ON log_body REGEXP pattern
+  WHERE log_line < log_msg_line() AND
+        log_msg_src IS NOT NULL AND
+        log_thread_id IS $curr_thread_id AND
+        pattern IS NOT NULL
+  ORDER BY log_line ASC
+  LIMIT 1
+;SELECT raise_error('No previous breakpoints found for this thread') WHERE $prev_line IS NULL;
+;UPDATE lnav_views SET selection = $prev_line WHERE name = 'log';
+`;
+
+        sendDebuggerCommand(this._attachArgs, '/exec', reverseContinueScript)
+            .then(() => {
+                outputChannel.info(`continued to the next breakpoint`);
+                response.success = true;
+                this.sendResponse(response);
+            })
+            .catch((err) => {
+                if (err instanceof ExecError) {
+                    this.sendErrorResponse(response, 3002, err.message);
+                } else {
+                    outputChannel.error(`error stepping to next line: ${err}`);
+                    this.sendErrorResponse(response, 3002, `Error stepping to next line: ${err}`);
+                }
+            });
     }
 
     protected nextRequest(response: DebugProtocol.NextResponse, args: DebugProtocol.NextArguments): void {

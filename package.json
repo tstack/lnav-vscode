@@ -33,6 +33,17 @@
                 "configuration": "./language-configuration.json"
             }
         ],
+        "breakpoints": [
+            {
+                "language": "cpp"
+            },
+            {
+                "language": "java"
+            },
+            {
+                "language": "rust"
+            }
+        ],
         "grammars": [
             {
                 "language": "lnav",
@@ -56,7 +67,9 @@
                 "program": "./out/debugAdapter.js",
                 "runtime": "node",
                 "languages": [
-                    "cpp"
+                    "cpp",
+                    "java",
+                    "rust"
                 ],
                 "configurationAttributes": {
                     "launch": {
