@@ -95,7 +95,8 @@ const createBreakpointTableScript = `
 ;CREATE TABLE IF NOT EXISTS vscode_breakpoints (
     pattern TEXT PRIMARY KEY,
     path TEXT,
-    breakpoint_id INTEGER
+    breakpoint_id INTEGER,
+    condition TEXT
 )
 `;
 
@@ -124,6 +125,10 @@ const getThreadIdsScript = `
 :write-json-to -
 `;
 
+function encodeValueForHeader(value: string): string {
+    return Buffer.from(value).toString('base64')
+}
+
 function getDebuggerInfo(args: IAttachRequestArguments, path: string): Promise<any> {
     const timeoutMs = 10000;
     const retryDelayMs = 1000;
@@ -138,7 +143,7 @@ function getDebuggerInfo(args: IAttachRequestArguments, path: string): Promise<a
                 path: path,
                 method: 'GET',
                 headers: {
-                    'X-Api-Key': Buffer.from(args.apiKey).toString('base64'),
+                    'X-Api-Key': encodeValueForHeader(args.apiKey),
                 }
             };
 
@@ -190,15 +195,26 @@ function sendDebuggerCommand(
     args: IAttachRequestArguments,
     path: string,
     data: string,
-    headers?: Record<string, string>
+    headers?: Record<string, string> | Map<string, string>
 ): Promise<any> {
     return new Promise((resolve, reject) => {
         const defaultHeaders: Record<string, string> = {
-            'X-Api-Key': Buffer.from(args.apiKey).toString('base64'),
+            'X-Api-Key': encodeValueForHeader(args.apiKey),
             'Content-Type': path == '/exec' ? 'text/x-lnav-script' : 'application/json',
             'Content-Length': Buffer.byteLength(data).toString()
         };
-        const mergedHeaders = { ...defaultHeaders, ...(headers ?? {}) };
+
+        // convert Map to plain object if needed
+        let providedHeaders: Record<string, string> = {};
+        if (headers) {
+            if (headers instanceof Map) {
+                providedHeaders = Object.fromEntries(headers.entries());
+            } else {
+                providedHeaders = headers;
+            }
+        }
+
+        const mergedHeaders = { ...defaultHeaders, ...providedHeaders };
 
         const options: http.RequestOptions = {
             hostname: 'localhost',
@@ -390,6 +406,7 @@ export class DebugSession extends LoggingDebugSession {
         response.body.supportsStepBack = true;
         // response.body.supportsBreakpointLocationsRequest = true;
         response.body.supportTerminateDebuggee = true;
+        response.body.supportsConditionalBreakpoints = true;
 
         this.sendResponse(response);
     }
@@ -401,13 +418,22 @@ export class DebugSession extends LoggingDebugSession {
         // TODO handle lines?
         const bps = args.breakpoints || [];
         let bpsOut = new Array<DebugProtocol.Breakpoint>();
+        let extraHeader = new Map<string, string>();
+        extraHeader.set('X-Source-File', encodeValueForHeader(bpPath));
         const script = deleteBreakpointsScript.concat(bps.map((sourceBp) => {
             let bpid = this._nextBreakpointId;
             this._nextBreakpointId += 1;
+            if (sourceBp.condition && sourceBp.condition.startsWith("/") && sourceBp.condition.endsWith("/")) {
+                const condRegex = sourceBp.condition.slice(1, -1);
+                extraHeader.set(`X-Bp-Cond${bpid}`, encodeValueForHeader(condRegex));
+            }
             const populateBreakpointTableScript = `
 ;REPLACE INTO vscode_breakpoints
-    SELECT sls.pattern, $headers ->> '$.x-source-file', ${bpid}
-      FROM source_log_stmt($headers ->> '$.x-source-file') AS sls
+    SELECT sls.pattern,
+           CAST (decode($headers ->> '$.x-source-file', 'base64') AS TEXT),
+           ${bpid},
+           CAST (decode($headers ->> ('$.x-bp-cond' || ${bpid}), 'base64') AS TEXT)
+      FROM source_log_stmt(CAST(decode($headers ->> '$.x-source-file', 'base64') AS TEXT)) AS sls
      WHERE ${sourceBp.line} BETWEEN sls.begin_line AND sls.end_line
 `;
             bpsOut.push({ id: bpid, line: sourceBp.line, verified: true });
@@ -418,10 +444,7 @@ export class DebugSession extends LoggingDebugSession {
         response.body = {
             breakpoints: bpsOut,
         };
-        const extraHeader: Record<string, string> = {
-            'X-Source-File': bpPath,
-        };
-        outputChannel.info(`breakpoints: ${extraHeader} -> ${script}`);
+        outputChannel.info(`breakpoints: ${JSON.stringify(Object.fromEntries(extraHeader))} -> ${script}`);
         return sendDebuggerCommand(this._attachArgs as IAttachRequestArguments, '/exec', script, extraHeader)
             .then(() => {
                 let event: DebugProtocol.StoppedEvent = new StoppedEvent('pause');
@@ -488,6 +511,7 @@ export class DebugSession extends LoggingDebugSession {
                 title: "lnav",
                 cwd: ".",
                 args: [
+                    "exec",
                     "/usr/local/bin/lnav",
                     "-d", "/tmp/vscode-lnav.err",
                     "-c", `:external-access 0 ${apiKey}`,
@@ -593,7 +617,7 @@ export class DebugSession extends LoggingDebugSession {
 ;SELECT thread_id AS curr_thread_id FROM all_thread_ids WHERE rowid = ${args.threadId}
 ;SELECT log_line AS next_line
    FROM all_logs
-   LEFT JOIN vscode_breakpoints ON log_body REGEXP pattern
+   LEFT JOIN vscode_breakpoints ON log_body REGEXP pattern AND (condition IS NULL OR log_body REGEXP condition)
   WHERE log_line > log_msg_line() AND
         log_msg_src IS NOT NULL AND
         log_thread_id IS $curr_thread_id AND
