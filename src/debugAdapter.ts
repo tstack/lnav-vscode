@@ -614,7 +614,9 @@ export class DebugSession extends LoggingDebugSession {
         outputChannel.info(`continueRequest ${JSON.stringify(args)}`);
 
         const continueScript = `
-;SELECT thread_id AS curr_thread_id FROM all_thread_ids WHERE rowid = ${args.threadId}
+;SELECT CASE thread_id WHEN '' THEN NULL ELSE thread_id END AS curr_thread_id
+   FROM all_thread_ids
+  WHERE rowid = ${args.threadId}
 ;SELECT log_line AS next_line
    FROM all_logs
    LEFT JOIN vscode_breakpoints ON log_body REGEXP pattern AND (condition IS NULL OR log_body REGEXP condition)
@@ -648,7 +650,9 @@ export class DebugSession extends LoggingDebugSession {
         outputChannel.info(`reverseContinueRequest ${JSON.stringify(args)}`);
 
         const reverseContinueScript = `
-;SELECT thread_id AS curr_thread_id FROM all_thread_ids WHERE rowid = ${args.threadId}
+;SELECT CASE thread_id WHEN '' THEN NULL ELSE thread_id END AS curr_thread_id
+   FROM all_thread_ids
+  WHERE rowid = ${args.threadId}
 ;SELECT log_line AS prev_line
    FROM all_logs
    LEFT JOIN vscode_breakpoints ON log_body REGEXP pattern
@@ -682,7 +686,9 @@ export class DebugSession extends LoggingDebugSession {
         outputChannel.info(`nextRequest ${JSON.stringify(args)}`);
 
         const nextLineScript = `
-;SELECT thread_id AS curr_thread_id FROM all_thread_ids WHERE rowid = ${args.threadId}
+;SELECT CASE thread_id WHEN '' THEN NULL ELSE thread_id END AS curr_thread_id
+   FROM all_thread_ids
+  WHERE rowid = ${args.threadId}
 ;SELECT log_line AS next_line
    FROM all_logs
   WHERE log_line > log_msg_line() AND
@@ -714,7 +720,9 @@ export class DebugSession extends LoggingDebugSession {
         outputChannel.info(`stepBackRequest ${JSON.stringify(args)}`);
 
         const prevLineScript = `
-;SELECT thread_id AS curr_thread_id FROM all_thread_ids WHERE rowid = ${args.threadId}
+;SELECT CASE thread_id WHEN '' THEN NULL ELSE thread_id END AS curr_thread_id
+   FROM all_thread_ids
+  WHERE rowid = ${args.threadId}
 ;SELECT log_line AS prev_line
    FROM all_logs
   WHERE log_line < log_msg_line() AND
