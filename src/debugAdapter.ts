@@ -14,6 +14,8 @@ import {
     ProgressStartEvent,
     ProgressEndEvent,
     ProgressUpdateEvent,
+    ExitedEvent,
+    TerminatedEvent,
 } from '@vscode/debugadapter';
 import { DebugProtocol } from '@vscode/debugprotocol';
 import * as vscode from 'vscode';
@@ -45,6 +47,7 @@ interface SourceRef {
 
 interface ViewStates {
     log: string,
+    log_selection: string,
     text: string,
 }
 
@@ -114,14 +117,16 @@ const findBreakpointIdScript = `
 `;
 
 const getThreadIdsScript = `
-;SELECT log_time AS curr_time FROM all_logs WHERE log_line = log_msg_line() LIMIT 1
+;SELECT log_time AS curr_time, log_stack_trace AS trace FROM all_logs WHERE log_line = log_msg_line() LIMIT 1
 ;SELECT rowid,
         CASE thread_id
           WHEN '' THEN 'untitled'
           ELSE thread_id
         END AS thread_id
    FROM all_thread_ids
-  WHERE $curr_time BETWEEN earliest AND latest;
+  WHERE $curr_time BETWEEN earliest AND latest
+  UNION ALL
+  SELECT 100000001, '_Exception_' WHERE $trace IS NOT NULL
 :write-json-to -
 `;
 
@@ -262,7 +267,7 @@ function sendDebuggerCommand(
 export class DebugSession extends LoggingDebugSession {
     private _initArgs: DebugProtocol.InitializeRequestArguments | undefined;
     private _attachArgs: IAttachRequestArguments = { port: 0, apiKey: "" };
-    private _pollInput: PollInput = { last_event_id: 0, view_states: { log: "", text: "" }, task_states: [] };
+    private _pollInput: PollInput = { last_event_id: 0, view_states: { log: "", log_selection: "", text: "" }, task_states: [] };
     private _mapping: Map<number, LogMapping> = new Map();
     private _variableHandles: Map<number, Handles<'locals'>> = new Map();
     private _variableToFrame: Map<number, number> = new Map();
@@ -340,8 +345,7 @@ export class DebugSession extends LoggingDebugSession {
                     this._pollInput = pollResult.next_input;
                     // Only send StoppedEvent if PollInput has changed
                     if (this._initialized &&
-                        (pollResult.next_input.view_states.log !== prevViewStates.log ||
-                            pollResult.next_input.view_states.text !== prevViewStates.text ||
+                        (pollResult.next_input.view_states.log_selection !== prevViewStates.log_selection ||
                             task_ended)
                     ) {
                         sendDebuggerCommand(this._attachArgs, '/exec', findBreakpointIdScript)
@@ -360,7 +364,7 @@ export class DebugSession extends LoggingDebugSession {
                                 this.pollLnav();
                             })
                             .catch((err) => {
-                                outputChannel.error(`poll failed ${err}`);
+                                outputChannel.error(`poll /exec failed ${err}`);
                                 this.pollLnav();
                             });
                     } else {
@@ -369,6 +373,8 @@ export class DebugSession extends LoggingDebugSession {
                 })
                 .catch((err) => {
                     outputChannel.error(`poll failed: ${err}`);
+                    let event: DebugProtocol.TerminatedEvent = new TerminatedEvent();
+                    this.sendEvent(event);
                 });
         }
     }
@@ -770,6 +776,43 @@ export class DebugSession extends LoggingDebugSession {
 
     protected stackTraceRequest(response: DebugProtocol.StackTraceResponse, args: DebugProtocol.StackTraceArguments): Promise<void> {
         outputChannel.info(`stackTraceRequest ${JSON.stringify(args)}`);
+
+        if (args.threadId == 100000001) {
+            const getExceptionTraceScript = `
+;SELECT json(log_stack_trace) AS trace FROM all_logs WHERE log_line = log_msg_line()
+:write-json-to -
+`;
+
+            return sendDebuggerCommand(this._attachArgs as IAttachRequestArguments, '/exec', getExceptionTraceScript)
+                .then((row) => {
+                    let row0 = row[0];
+
+                    outputChannel.info(`row0 ${JSON.stringify(row0)}`);
+
+                    // row0 is expected to be an array of frames with { name, sourcePath, lineNumber }
+                    const frames: StackFrame[] = [];
+                    if (row0.trace) {
+                        for (let i = 0; i < row0.trace.length; i++) {
+                            const el = row0.trace[i];
+                            const srcRef: SourceRef = {
+                                sourcePath: el.sourcePath,
+                                lineNumber: el.lineNumber,
+                                name: el.name,
+                                column: 1,
+                            };
+                            frames.push(this.buildStackFrame(i, srcRef));
+                        }
+                    }
+
+                    response.body = {
+                        stackFrames: frames,
+                        totalFrames: frames.length
+                    };
+                    outputChannel.info(`response ${JSON.stringify(response.body)}`);
+
+                    this.sendResponse(response);
+                });
+        }
 
         const getCurrLineScript = `
 ;SELECT
