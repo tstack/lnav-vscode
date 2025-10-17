@@ -205,7 +205,7 @@ function sendDebuggerCommand(
     return new Promise((resolve, reject) => {
         const defaultHeaders: Record<string, string> = {
             'X-Api-Key': encodeValueForHeader(args.apiKey),
-            'Content-Type': path == '/exec' ? 'text/x-lnav-script' : 'application/json',
+            'Content-Type': path === '/api/exec' ? 'text/x-lnav-script' : 'application/json',
             'Content-Length': Buffer.byteLength(data).toString()
         };
 
@@ -295,7 +295,7 @@ export class DebugSession extends LoggingDebugSession {
         const prevTaskStates = this._pollInput.task_states;
 
         if (this._attached) {
-            sendDebuggerCommand(this._attachArgs as IAttachRequestArguments, '/poll', JSON.stringify(this._pollInput))
+            sendDebuggerCommand(this._attachArgs as IAttachRequestArguments, '/api/poll', JSON.stringify(this._pollInput))
                 .then((pollResult: PollResult) => {
                     outputChannel.info(`pollLnav result: ${JSON.stringify(pollResult)}`);
 
@@ -348,7 +348,7 @@ export class DebugSession extends LoggingDebugSession {
                         (pollResult.next_input.view_states.log_selection !== prevViewStates.log_selection ||
                             task_ended)
                     ) {
-                        sendDebuggerCommand(this._attachArgs, '/exec', findBreakpointIdScript)
+                        sendDebuggerCommand(this._attachArgs, '/api/exec', findBreakpointIdScript)
                             .then((res: Array<FindBreakpointResult>) => {
                                 outputChannel.info(`stop breakpoints ${res}`);
                                 let event: DebugProtocol.StoppedEvent = new StoppedEvent(
@@ -364,7 +364,7 @@ export class DebugSession extends LoggingDebugSession {
                                 this.pollLnav();
                             })
                             .catch((err) => {
-                                outputChannel.error(`poll /exec failed ${err}`);
+                                outputChannel.error(`poll /api/exec failed ${err}`);
                                 this.pollLnav();
                             });
                     } else {
@@ -383,7 +383,7 @@ export class DebugSession extends LoggingDebugSession {
         outputChannel.info(`disconnectRequest suspend: ${args.suspendDebuggee}, terminate: ${args.terminateDebuggee}`);
         this._attached = false;
         if (args.terminateDebuggee) {
-            sendDebuggerCommand(this._attachArgs, '/exec', ':quit')
+            sendDebuggerCommand(this._attachArgs, '/api/exec', ':quit')
                 .finally(() => {
                     this.sendResponse(response);
                 });
@@ -394,7 +394,7 @@ export class DebugSession extends LoggingDebugSession {
 
     protected terminateRequest(response: DebugProtocol.TerminateResponse, args: DebugProtocol.TerminateArguments, request?: DebugProtocol.Request): void {
         outputChannel.info(`terminateRequest`);
-        sendDebuggerCommand(this._attachArgs, '/exec', ':quit')
+        sendDebuggerCommand(this._attachArgs, '/api/exec', ':quit')
             .finally(() => {
                 this.sendResponse(response);
             });
@@ -451,7 +451,7 @@ export class DebugSession extends LoggingDebugSession {
             breakpoints: bpsOut,
         };
         outputChannel.info(`breakpoints: ${JSON.stringify(Object.fromEntries(extraHeader))} -> ${script}`);
-        return sendDebuggerCommand(this._attachArgs as IAttachRequestArguments, '/exec', script, extraHeader)
+        return sendDebuggerCommand(this._attachArgs as IAttachRequestArguments, '/api/exec', script, extraHeader)
             .then(() => {
                 let event: DebugProtocol.StoppedEvent = new StoppedEvent('pause');
                 event.body.allThreadsStopped = true;
@@ -472,7 +472,7 @@ export class DebugSession extends LoggingDebugSession {
 
         this._attachArgs = args;
 
-        return getDebuggerInfo(args, '/version').then((info): Promise<void> => {
+        return getDebuggerInfo(args, '/api/version').then((info): Promise<void> => {
             this._attached = true;
             outputChannel.info(`lnav version: ${info.version}`);
             this.sendResponse(response);
@@ -484,7 +484,7 @@ export class DebugSession extends LoggingDebugSession {
                 .map(folder => `:add-source-path ${folder.uri.fsPath}\n`)
                 .join('\n').concat(createBreakpointTableScript);
             outputChannel.info(`init script: ${initScript}`);
-            return sendDebuggerCommand(this._attachArgs as IAttachRequestArguments, '/exec', initScript)
+            return sendDebuggerCommand(this._attachArgs as IAttachRequestArguments, '/api/exec', initScript)
                 .then(() => {
                 });
         }).catch((err) => {
@@ -577,7 +577,7 @@ export class DebugSession extends LoggingDebugSession {
         this._variableHandles.clear();
         this._variableToFrame.clear();
         // Fetch the latest threads from lnav
-        return sendDebuggerCommand(this._attachArgs, '/exec', getThreadIdsScript)
+        return sendDebuggerCommand(this._attachArgs, '/api/exec', getThreadIdsScript)
             .then((threads: { rowid: number, thread_id: string }[]) => {
                 const latestThreadIds = new Set<number>();
                 const threadObjs: DebugProtocol.Thread[] = [];
@@ -636,7 +636,7 @@ export class DebugSession extends LoggingDebugSession {
 ;UPDATE lnav_views SET selection = $next_line WHERE name = 'log';
 `;
 
-        sendDebuggerCommand(this._attachArgs, '/exec', continueScript)
+        sendDebuggerCommand(this._attachArgs, '/api/exec', continueScript)
             .then(() => {
                 outputChannel.info(`continued to the next breakpoint`);
                 response.success = true;
@@ -672,7 +672,7 @@ export class DebugSession extends LoggingDebugSession {
 ;UPDATE lnav_views SET selection = $prev_line WHERE name = 'log';
 `;
 
-        sendDebuggerCommand(this._attachArgs, '/exec', reverseContinueScript)
+        sendDebuggerCommand(this._attachArgs, '/api/exec', reverseContinueScript)
             .then(() => {
                 outputChannel.info(`continued to the next breakpoint`);
                 response.success = true;
@@ -706,7 +706,7 @@ export class DebugSession extends LoggingDebugSession {
 ;UPDATE lnav_views SET selection = $next_line WHERE name = 'log';
 `;
 
-        sendDebuggerCommand(this._attachArgs, '/exec', nextLineScript)
+        sendDebuggerCommand(this._attachArgs, '/api/exec', nextLineScript)
             .then(() => {
                 outputChannel.info(`stepped to next line`);
                 response.success = true;
@@ -740,7 +740,7 @@ export class DebugSession extends LoggingDebugSession {
 ;UPDATE lnav_views SET selection = $prev_line WHERE name = 'log';
 `;
 
-        sendDebuggerCommand(this._attachArgs, '/exec', prevLineScript)
+        sendDebuggerCommand(this._attachArgs, '/api/exec', prevLineScript)
             .then(() => {
                 outputChannel.info(`stepped back one line`);
                 response.success = true;
@@ -783,7 +783,7 @@ export class DebugSession extends LoggingDebugSession {
 :write-json-to -
 `;
 
-            return sendDebuggerCommand(this._attachArgs as IAttachRequestArguments, '/exec', getExceptionTraceScript)
+            return sendDebuggerCommand(this._attachArgs as IAttachRequestArguments, '/api/exec', getExceptionTraceScript)
                 .then((row) => {
                     let row0 = row[0];
 
@@ -831,7 +831,7 @@ export class DebugSession extends LoggingDebugSession {
 :write-json-to -
 `;
 
-        return sendDebuggerCommand(this._attachArgs as IAttachRequestArguments, '/exec', getCurrLineScript)
+        return sendDebuggerCommand(this._attachArgs as IAttachRequestArguments, '/api/exec', getCurrLineScript)
             .then((row) => {
                 outputChannel.info(`got current line: ${JSON.stringify(row)}`);
                 let row0 = row[0];
